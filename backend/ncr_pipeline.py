@@ -31,6 +31,8 @@ Folder structure example:
     └── NCR-2024-0455.png          (screenshot)
 """
 
+from __future__ import annotations
+
 import os
 import re
 import json
@@ -42,15 +44,19 @@ from datetime import datetime
 from typing import Optional
 from enum import Enum
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
-import anthropic
+from google import genai
+from google.genai import types as genai_types
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # Supported file extensions
 PDF_EXTENSIONS = {".pdf"}
@@ -191,7 +197,7 @@ class StructuredNCRRow(BaseModel):
 class BaseAgent:
     """Base class for LLM-powered agents."""
 
-    def __init__(self, name: str, client: anthropic.AsyncAnthropic):
+    def __init__(self, name: str, client: genai.Client):
         self.name = name
         self.client = client
         self.logger = logging.getLogger(f"agent.{name}")
@@ -199,23 +205,20 @@ class BaseAgent:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
     async def _call_llm(self, system_prompt: str, user_content: list | str) -> str:
         """
-        Call Claude with retry logic.
-        user_content can be a string or a list of content blocks
+        Call Gemini with retry logic.
+        user_content can be a string or a list of content parts
         (for multi-modal — text + images).
         """
         self.logger.info("Calling LLM...")
-        if isinstance(user_content, str):
-            messages = [{"role": "user", "content": user_content}]
-        else:
-            messages = [{"role": "user", "content": user_content}]
-
-        response = await self.client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=4000,
-            system=system_prompt,
-            messages=messages,
+        response = await self.client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_content,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=4000,
+            ),
         )
-        return response.content[0].text
+        return response.text
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -458,11 +461,11 @@ Extract and normalise the NCR fields from the above text."""
         )
 
     async def _parse_with_vision(self, ingested: IngestedFile) -> str:
-        """Send image directly to Claude Vision for better parsing of scanned forms."""
+        """Send image directly to Gemini Vision for better parsing of scanned forms."""
         self.logger.info(f"  Using vision parsing for {ingested.file_name}")
 
         with open(ingested.file_path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode("utf-8")
+            image_bytes = f.read()
 
         ext = Path(ingested.file_path).suffix.lower()
         media_type_map = {
@@ -474,13 +477,8 @@ Extract and normalise the NCR fields from the above text."""
         media_type = media_type_map.get(ext, "image/jpeg")
 
         content = [
-            {
-                "type": "image",
-                "source": {"type": "base64", "media_type": media_type, "data": image_data},
-            },
-            {
-                "type": "text",
-                "text": f"""This is a scanned/photographed NCR (Non-Conformance Report) form.
+            genai_types.Part.from_bytes(data=image_bytes, mime_type=media_type),
+            f"""This is a scanned/photographed NCR (Non-Conformance Report) form.
 File: {ingested.file_name}
 
 Additionally, here is OCR text extracted from the image (may contain errors):
@@ -492,7 +490,6 @@ Please extract and normalise all NCR fields from this document.
 Use BOTH the image and the OCR text to get the most accurate extraction.
 Pay special attention to dates — extract BOTH the date raised/opened AND the
 date resolved/closed/signed-off. Normalise all dates to YYYY-MM-DD format.""",
-            },
         ]
         return await self._call_llm(self.SYSTEM_PROMPT, content)
 
@@ -873,15 +870,15 @@ class NCRPipeline:
         pipeline.export(results, "ncr_report.xlsx")
     """
 
-    def __init__(self, anthropic_api_key: Optional[str] = None):
-        self.anthropic_client = anthropic.AsyncAnthropic(
-            api_key=anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+    def __init__(self, gemini_api_key: Optional[str] = None):
+        self.gemini_client = genai.Client(
+            api_key=gemini_api_key or os.getenv("GEMINI_API_KEY")
         )
         self.ingestor = FileIngestionAgent()
-        self.parser = DocumentParserAgent("parser", self.anthropic_client)
-        self.classifier = IssueClassifierAgent("classifier", self.anthropic_client)
-        self.ca_tagger = CorrectiveActionTaggerAgent("ca_tagger", self.anthropic_client)
-        self.pa_tagger = PreventiveActionTaggerAgent("pa_tagger", self.anthropic_client)
+        self.parser = DocumentParserAgent("parser", self.gemini_client)
+        self.classifier = IssueClassifierAgent("classifier", self.gemini_client)
+        self.ca_tagger = CorrectiveActionTaggerAgent("ca_tagger", self.gemini_client)
+        self.pa_tagger = PreventiveActionTaggerAgent("pa_tagger", self.gemini_client)
         self.structurer = TableStructurerAgent()
 
     async def process_single_file(self, file_path: Path) -> Optional[StructuredNCRRow]:
